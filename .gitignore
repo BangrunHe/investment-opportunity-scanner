@@ -1,0 +1,23 @@
+# ---- 密钥与个人数据（切勿提交）----
+.env
+.env.local
+
+# 个人持仓数据与快照截图
+data/
+Snapshot/
+
+# Supabase CLI 本地状态（含项目 ref）
+supabase/.temp/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
