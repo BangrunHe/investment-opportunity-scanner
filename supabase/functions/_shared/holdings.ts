@@ -139,7 +139,9 @@ export async function writeHoldings(
     const name = String(h.fund_name ?? "").trim();
     if (!name) continue;
 
-    const code = providedCode || (await lookupCodeByName(name));
+    // 优先按名字反查，避免一张截图含多只基金时全部套用同一代码（会串号：代码对、名字错）。
+    // providedCode 仅作为「用户回复 6 位代码」场景的兜底。
+    const code = (await lookupCodeByName(name)) || providedCode;
     if (!code) {
       missing.push(name);
       continue;
