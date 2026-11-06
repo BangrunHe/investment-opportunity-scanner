@@ -142,7 +142,32 @@ select jobname, schedule, active from cron.job;
 |---|---|
 | Send a fund screenshot into the group | Within 10 minutes: OCR → stored → replies with the holdings table |
 | (New fund only) reply with the 6-digit code | Pairs it with the pending snapshot and stores it |
+| Sold a fund completely → reply `清仓 007606` | Writes a zero row; the fund leaves the table and is not resurrected next week |
 | Nothing | Monday 09:00: posts the weekly action plan |
+
+### Incremental uploads
+
+You only need to send the screenshots of funds whose values **changed**. After every
+write the function carries the other funds forward from their most recent row, so each
+`week` is a complete snapshot rather than just the delta you uploaded. The reply tells
+you how it was composed:
+
+```
+✅ 已入库 1 只，顺延保留 7 只未变动的基金
+
+📋 当前持仓（8 只 · 合计 12,106.81 元）
+```
+
+Without that carry-forward, a week would contain only the funds in that week's
+screenshots — the table would look like earlier funds had been lost, and cross-week
+totals and weights would be wrong. Already-populated rows for the current week are
+never overwritten by the carry-forward step, so re-running is safe.
+
+`清仓` (also accepts `卖出` / `移除` / `删除`) writes a deliberate `holding_assets = 0`
+row instead of deleting the fund. A zero value keeps travelling forward through the
+carry-forward chain, so the fund cannot come back from history, while its earlier rows
+stay intact for the return curve. Zero-value rows are filtered out of both the group
+reply and the weekly report.
 
 Run a function manually when debugging:
 
@@ -164,10 +189,25 @@ The backend is designed so that running anything twice changes nothing.
 | Chat messages | `processed_messages` keyed by `message_id` — a message is never handled twice |
 | Holdings rows | `unique(week, fund_code)` + upsert — same week, same fund = overwrite, never duplicate |
 | Across weeks | Each week writes its own row, so history is preserved |
+| Unchanged funds | Carried forward into the current week from their latest row — every week stays a full snapshot |
 | External calls | News, LLM and OCR are each wrapped — a failing dependency degrades one section, it does not fail the run |
 
 Re-uploading a fund in the same week overwrites that week's row with the newer figures,
 which is the intended behaviour.
+
+### Upgrading data written before the carry-forward release
+
+Older rows only contain what was uploaded in each week, so historical weeks are partial.
+Backfill them once:
+
+```bash
+python tools/backfill_holdings.py            # dry run: prints what would be added
+python tools/backfill_holdings.py --apply    # writes to fund_holdings + holding_snapshots
+```
+
+Existing rows for a week are never modified — only the gaps are filled. A week with no
+rows at all (nothing uploaded that week) stays a gap; insert it by hand if you want an
+unbroken return curve.
 
 ---
 

@@ -15,6 +15,7 @@ import {
   type ChatMessage,
 } from "../_shared/feishu.ts";
 import {
+  clearFund,
   currentWeek,
   holdingsSummary,
   lookupCodeByName,
@@ -42,6 +43,12 @@ function parseContent(m: ChatMessage): Record<string, unknown> {
 function extractCode(text: string): string {
   const m = text.match(/(\d{6})/);
   return m ? m[1] : "";
+}
+
+/** 入库回执抬头：说明本次新增了几只、顺延保留了几只 */
+function writeNote(results: string[], carried: string[], prefix = "✅ 已入库"): string {
+  if (!carried.length) return `${prefix} ${results.length} 只`;
+  return `${prefix} ${results.length} 只，顺延保留 ${carried.length} 只未变动的基金`;
 }
 
 async function archive(appToken: string, tableId: string, code: string, results: string[]) {
@@ -96,10 +103,13 @@ Deno.serve(async (req) => {
             const name = String(rows[0].fund_name ?? "");
             const code = await lookupCodeByName(name);
             if (code) {
-              const { results } = await writeHoldings(rows, code, week);
-              await sendImMessage(chatId, `✅ 已入库\n\n${await holdingsSummary(week)}`);
+              const { results, carried } = await writeHoldings(rows, code, week);
+              await sendImMessage(
+                chatId,
+                `${writeNote(results, carried)}\n\n${await holdingsSummary(week)}`,
+              );
               await archive(appToken, tableId, code, results);
-              handled.push({ type: "image", name, code, results });
+              handled.push({ type: "image", name, code, results, carried });
             } else {
               await db.from("pending_snapshots").insert({
                 message_id: m.message_id,
@@ -118,20 +128,35 @@ Deno.serve(async (req) => {
           const code = extractCode(text);
           if (!code) continue; // 不是代码消息，忽略（不计入已处理）
 
-          const { data: pend } = await db
-            .from("pending_snapshots")
-            .select("*")
-            .order("created_at", { ascending: false })
-            .limit(1);
-          const p = pend?.[0];
-          if (!p) continue; // 没有待补快照，忽略
+          if (/清仓|卖出|移除|删除/.test(text)) {
+            // 清仓：写入 0 值墓碑行，顺延逻辑会继续把 0 带下去，基金不会在下周被历史数据复活
+            const name = await clearFund(code, week);
+            await sendImMessage(
+              chatId,
+              `🗑 已清仓「${name}」（${code}），后续周不再计入持仓。\n\n${await holdingsSummary(week)}`,
+            );
+            handled.push({ type: "text", action: "clear", name, code });
+          } else {
+            const { data: pend } = await db
+              .from("pending_snapshots")
+              .select("*")
+              .order("created_at", { ascending: false })
+              .limit(1);
+            const p = pend?.[0];
+            if (!p) continue; // 没有待补快照，忽略
 
-          const rows = (p.payload ?? []) as Holding[];
-          const { results } = await writeHoldings(rows, code, week);
-          await db.from("pending_snapshots").delete().eq("id", p.id);
-          await sendImMessage(chatId, `✅ 已补全并入库（${code}）\n\n${await holdingsSummary(week)}`);
-          await archive(appToken, tableId, code, results);
-          handled.push({ type: "text", code, results });
+            const rows = (p.payload ?? []) as Holding[];
+            const { results, carried } = await writeHoldings(rows, code, week);
+            await db.from("pending_snapshots").delete().eq("id", p.id);
+            await sendImMessage(
+              chatId,
+              `${writeNote(results, carried, `✅ 已补全并入库（${code}）`)}\n\n${
+                await holdingsSummary(week)
+              }`,
+            );
+            await archive(appToken, tableId, code, results);
+            handled.push({ type: "text", code, results, carried });
+          }
         } else {
           continue; // 其它类型不处理，也不标记已处理
         }

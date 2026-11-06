@@ -25,9 +25,14 @@ export interface Holding {
 }
 
 export interface WriteResult {
-  results: string[]; // 成功写入的说明
+  results: string[]; // 本次上传成功写入的说明
   missing: string[]; // 缺基金代码的基金名
+  carried: string[]; // 本周未上传、按历史最新值顺延保留的基金名
 }
+
+/** 顺延时完整搬运的字段 */
+const CARRY_FIELDS =
+  "fund_code,fund_name,holding_assets,holding_cost,holding_profit,holding_shares,unit_cost,week_nav";
 
 function toNum(v: unknown): number | null {
   if (v === null || v === undefined || v === "") return null;
@@ -77,7 +82,50 @@ export async function lookupCodeByName(name: string): Promise<string> {
   return (data?.[0]?.fund_code as string) ?? "";
 }
 
-/** 写入持仓：static_funds + fund_holdings + holding_snapshots（幂等） */
+/**
+ * 顺延：把「本周之前每只基金的最新一条」补进本周，使每周都是一份**完整快照**。
+ *
+ * 为什么需要：用户每周只会发「有变动的那几只」截图，属于增量上传。
+ * 若只写 OCR 到的行，本周就只含本次上传的子集，导致
+ *   - 群里回执只显示当周几只（看起来像「之前的基金丢了」）
+ *   - 跨周对比、占比、总资产全部失真
+ *
+ * 已存在本周的行不会被覆盖（含人工清仓写入的 0 值），因此可重复执行。
+ */
+async function carryForward(week: string): Promise<string[]> {
+  const db = supabase();
+
+  // 本周已有哪些基金
+  const { data: cur } = await db.from("fund_holdings").select("fund_code").eq("week", week);
+  const have = new Set((cur ?? []).map((r) => r.fund_code as string));
+
+  // 本周之前，每只基金的最新一条（week 形如 2026-11-02~2026-11-08，可直接字典序比较）
+  const { data: prev } = await db
+    .from("fund_holdings")
+    .select(`${CARRY_FIELDS},week`)
+    .lt("week", week)
+    .order("week", { ascending: true })
+    .limit(10000);
+
+  const latest = new Map<string, Record<string, unknown>>();
+  for (const r of prev ?? []) latest.set(String(r.fund_code), r as Record<string, unknown>);
+
+  const carried: string[] = [];
+  for (const [code, r] of latest) {
+    if (have.has(code)) continue;
+    // 历史行只有 CARRY_FIELDS + week，没有 id；后面的 week 覆盖历史周
+    await db.from("fund_holdings").upsert({ ...r, week }, { onConflict: "week,fund_code" });
+    await db.from("holding_snapshots").upsert(
+      { week, fund_code: code, fund_name: r.fund_name, holding_assets: r.holding_assets },
+      { onConflict: "week,fund_code" },
+    );
+    carried.push(String(r.fund_name ?? code));
+    have.add(code);
+  }
+  return carried;
+}
+
+/** 写入持仓：static_funds + fund_holdings + holding_snapshots（幂等）+ 顺延未上传的基金 */
 export async function writeHoldings(
   rows: Holding[],
   providedCode: string,
@@ -123,7 +171,43 @@ export async function writeHoldings(
     results.push(`${name}（${code}）：已写入`);
   }
 
-  return { results, missing };
+  // 本次上传是增量，其余历史基金按最新值顺延到本周
+  const carried = await carryForward(week);
+
+  return { results, missing, carried };
+}
+
+/**
+ * 清仓 / 移除一只基金：写入 holding_assets = 0 的墓碑行。
+ * 用 0 而不是删除记录，这样顺延逻辑会继续把 0 带下去，
+ * 基金不会在下周被历史数据复活，同时保留完整的持仓变化痕迹。
+ */
+export async function clearFund(code: string, week: string): Promise<string> {
+  const db = supabase();
+  const { data } = await db
+    .from("fund_holdings")
+    .select("fund_name")
+    .eq("fund_code", code)
+    .limit(1);
+  const name = String(data?.[0]?.fund_name ?? code);
+
+  await db.from("fund_holdings").upsert(
+    {
+      fund_code: code,
+      fund_name: name,
+      holding_assets: 0,
+      holding_cost: 0,
+      holding_profit: 0,
+      holding_shares: 0,
+      week,
+    },
+    { onConflict: "week,fund_code" },
+  );
+  await db.from("holding_snapshots").upsert(
+    { week, fund_code: code, fund_name: name, holding_assets: 0 },
+    { onConflict: "week,fund_code" },
+  );
+  return name;
 }
 
 // ---------- 纯文本等宽表格（飞书文本消息不支持真表格，用对齐模拟） ----------
@@ -233,12 +317,14 @@ export async function holdingsSummary(week: string): Promise<string> {
     .select("fund_code,fund_name,holding_assets")
     .eq("week", week);
 
-  const rows = (data ?? []) as HoldingLine[];
+  const rows = ((data ?? []) as HoldingLine[]).filter((r) => (r.holding_assets ?? 0) > 0);
   if (!rows.length) return "（暂无持仓记录）";
 
   const cats = await categoryMap();
   for (const r of rows) r.category = cats.get(r.fund_code) ?? "";
-  return renderHoldingsTable(rows, `📋 当前持仓（${rows.length} 只 · ${week}）`);
+
+  const total = rows.reduce((s, r) => s + (r.holding_assets || 0), 0);
+  return renderHoldingsTable(rows, `📋 当前持仓（${rows.length} 只 · 合计 ${fmtTotal(total)} 元）`);
 }
 
 /** 持仓总览：每只基金取「最新一周」的记录（用于周报；跨周也能显示全） */
@@ -247,15 +333,17 @@ export async function latestHoldingsSummary(): Promise<string> {
   const { data } = await db
     .from("fund_holdings")
     .select("fund_code,fund_name,holding_assets,week")
-    .order("week", { ascending: true });
+    .order("week", { ascending: true })
+    .limit(10000);
 
   const rows = (data ?? []) as (HoldingLine & { week: string })[];
   if (!rows.length) return "（暂无持仓记录）";
 
-  // 升序遍历，后面的（更新的周）覆盖前面的
+  // 升序遍历，后面的（更新的周）覆盖前面的；清仓墓碑行（0 元）自然被最后一笔覆盖后过滤掉
   const latest = new Map<string, HoldingLine & { week: string }>();
   for (const r of rows) latest.set(r.fund_code, r);
-  const list = Array.from(latest.values());
+  const list = Array.from(latest.values()).filter((r) => (r.holding_assets ?? 0) > 0);
+  if (!list.length) return "（暂无持仓记录）";
 
   const cats = await categoryMap();
   for (const r of list) r.category = cats.get(r.fund_code) ?? "";
